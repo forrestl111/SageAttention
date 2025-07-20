@@ -11,7 +11,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(torch::Tensor q
                     int is_causal,
                     int qk_quant_gran,
                     float sm_scale,
-                    int return_lse)
+                    int return_lse,
+                    c10::optional<torch::Tensor> block_index = c10::nullopt)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -44,6 +45,11 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(torch::Tensor q
   CHECK_DIMS(query_scale, 3);
   CHECK_DIMS(key_scale, 3);
   CHECK_DIMS(value_scale, 3);
+
+  // Check if sparse attention is requested on non-SM90 architecture
+  if (block_index.defined()) {
+    TORCH_CHECK(false, "Sparse attention with block_index is not supported on SM89 architecture. Please use SM90 or higher.");
+  }
 
   const int batch_size = query.size(0);
   const int head_dim = query.size(3);
