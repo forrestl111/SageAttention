@@ -103,7 +103,7 @@ def create_sparse_block_indices(batch_size: int, num_heads: int, num_q_blocks: i
     return block_indices
 
 def generate_test_tensors(batch_size: int, num_heads: int, seq_len: int, head_dim: int, 
-                         tensor_layout: str = "NHD", dtype: torch.dtype = torch.float16) -> Tuple[torch.Tensor, ...]:
+                         tensor_layout: str = "HND", dtype: torch.dtype = torch.float16) -> Tuple[torch.Tensor, ...]:
     """Generate test tensors for attention computation."""
     
     if tensor_layout == "NHD":
@@ -121,20 +121,23 @@ def generate_test_tensors(batch_size: int, num_heads: int, seq_len: int, head_di
 
 def test_correctness(batch_size: int = 2, num_heads: int = 8, seq_len: int = 2048, 
                     head_dim: int = 128, top_k_ratio: float = 0.5, 
-                    pattern: str = "random", tensor_layout: str = "NHD", 
+                    pattern: str = "random", tensor_layout: str = "HND", 
                     qk_quant_gran: str = "per_thread", dtype: torch.dtype = torch.float16) -> float:
     """
     Test correctness of sparse attention by comparing with dense attention
     on the same subset of blocks.
     """
+    assert tensor_layout == "HND", "Only HND layout is supported for correctness test"
+
     print(f"\n=== Correctness Test ===")
     print(f"Config: B={batch_size}, H={num_heads}, S={seq_len}, D={head_dim}")
     print(f"Pattern: {pattern}, Top-K ratio: {top_k_ratio}")
     print(f"Layout: {tensor_layout}, Quantization: {qk_quant_gran}, Dtype: {dtype}")
     
     # Generate test data
+    print("batch_size: ", batch_size, "num_heads: ", num_heads, "seq_len: ", seq_len, "head_dim: ", head_dim, "tensor_layout: ", tensor_layout, "dtype: ", dtype)
     q, k, v = generate_test_tensors(batch_size, num_heads, seq_len, head_dim, tensor_layout, dtype)
-    
+    print("q: ", q.shape, "k: ", k.shape, "v: ", v.shape)
     # Create sparse block indices
     CTA_Q, CTA_K = 64, 128
     num_q_blocks = (seq_len + CTA_Q - 1) // CTA_Q
@@ -158,7 +161,7 @@ def test_correctness(batch_size: int = 2, num_heads: int = 8, seq_len: int = 204
             sm_scale=sm_scale,
             smooth_k=True,
             return_lse=False,
-            block_index=block_indices  # Sparse attention
+            block_index=block_indices,
         )
         torch.cuda.synchronize()
         print("✅ Sparse attention executed successfully")
@@ -169,60 +172,36 @@ def test_correctness(batch_size: int = 2, num_heads: int = 8, seq_len: int = 204
         # For verification, we simulate sparse attention by selectively copying
         # from dense attention based on the block indices
         seq_dim = 1 if tensor_layout == "NHD" else 2
-        
-        for q_block_idx in range(num_q_blocks):
-            print(f"q_block_idx: {q_block_idx}, top_k: {top_k}")
-            # Calculate query block range
-            q_start = q_block_idx * CTA_Q
-            q_end = min(q_start + CTA_Q, seq_len)
-            
-            # Get selected key blocks for this query block [batch_size, num_heads, top_k]
-            selected_k_blocks = block_indices[:, :, q_block_idx]
-            
-            # Collect selected key and value segments for all batches and heads
-            k_segments = []
-            v_segments = []
-            
-            for k_rel_idx in range(top_k):
-                print(f"k_rel_idx: {k_rel_idx}")
-                # Get k_block_idx for all batches and heads
-                k_block_indices = selected_k_blocks[:, :, k_rel_idx]  # [batch_size, num_heads]
-                print("1")
-                # For simplicity, assume all batches/heads use the same block pattern
-                # (this is typically the case in practice)
-                k_block_idx = k_block_indices[0, 0].item()
-                print("2")
-                k_start = k_block_idx * CTA_K
-                print("3")
-                k_end = min(k_start + CTA_K, seq_len)
-                print("4")
-                # Extract key and value segments (keep batch and head dimensions)
-                k_segments.append(k[:, :, k_start:k_end, :])
-                v_segments.append(v[:, :, :, k_start:k_end])
-            
-            # Concatenate selected segments
-            k_concat = torch.cat(k_segments, dim=2)  # [batch_size, num_heads, total_k_len, head_dim]
-            v_concat = torch.cat(v_segments, dim=3)  # [batch_size, num_heads, head_dim, total_k_len]
-            
-            # Extract query block (keep batch and head dimensions)
-            q_block = q[:, :, q_start:q_end, :]  # [batch_size, num_heads, q_block_size, head_dim]
-            
-            print(f"q_block: {q_block.shape}, k_concat: {k_concat.shape}, v_concat: {v_concat.shape}")
-            # Run dense attention on selected blocks
-            o_block = sageattn_qk_int8_pv_fp8_cuda_sm90(
-                q_block, k_concat, v_concat, 
-                tensor_layout=tensor_layout,
-                is_causal=False,
-                qk_quant_gran=qk_quant_gran,
-                sm_scale=sm_scale,
-                smooth_k=True,
-                return_lse=False,
-                block_index=None
-            )
-            
-            # Copy result to reference output
-            o_reference[:, :, q_start:q_end, :] = o_block
-                        
+        # For each batch and head, compute reference output block separately
+        for b in range(batch_size):
+            for h in range(num_heads):
+                for q_block_idx in range(num_q_blocks):
+                    q_start = q_block_idx * CTA_Q
+                    q_end = min(q_start + CTA_Q, seq_len)
+                    # Get selected key blocks for this query block for this b, h
+                    selected_k_blocks = block_indices[b, h, q_block_idx]  # [top_k]
+                    k_segments = []
+                    v_segments = []
+                    for k_rel_idx in range(top_k):
+                        k_block_idx = selected_k_blocks[k_rel_idx].item()
+                        k_start = k_block_idx * CTA_K
+                        k_end = min(k_start + CTA_K, seq_len)
+                        k_segments.append(k[b:b+1, h:h+1, k_start:k_end, :])
+                        v_segments.append(v[b:b+1, h:h+1, k_start:k_end, :])
+                    k_concat = torch.cat(k_segments, dim=2)  # [1, 1, total_k_len, head_dim]
+                    v_concat = torch.cat(v_segments, dim=2)  # [1, 1, total_k_len, head_dim]
+                    q_block = q[b:b+1, h:h+1, q_start:q_end, :]  # [1, 1, q_block_size, head_dim]
+                    o_block = sageattn_qk_int8_pv_fp8_cuda_sm90(
+                        q_block, k_concat, v_concat,
+                        tensor_layout=tensor_layout,
+                        is_causal=False,
+                        qk_quant_gran=qk_quant_gran,
+                        sm_scale=sm_scale,
+                        smooth_k=True,
+                        return_lse=False,
+                        block_index=None,
+                    )
+                    o_reference[b:b+1, h:h+1, q_start:q_end, :] = o_block
 
         print("✅ Reference computation completed")
         
@@ -242,6 +221,10 @@ def test_correctness(batch_size: int = 2, num_heads: int = 8, seq_len: int = 204
         print(f"  - Mean Absolute Error: {abs_error:.6e}")
         print(f"  - Relative Error: {relative_error:.4f}%")
         print(f"  - Max Absolute Error: {max_error:.6e}")
+
+        if similarity < 0.99:
+            import ipdb; ipdb.set_trace()
+            raise ValueError(f"Cosine similarity is less than 0.99: {similarity:.6f}")
         
         # Calculate approximate memory savings
         dense_blocks = num_q_blocks * num_k_blocks
@@ -268,7 +251,7 @@ def test_correctness(batch_size: int = 2, num_heads: int = 8, seq_len: int = 204
 def benchmark_performance(batch_size: int = 4, num_heads: int = 32, head_dim: int = 128,
                          seq_lens: List[int] = [1024, 2048, 4096, 8192],
                          top_k_ratios: List[float] = [0.25, 0.5, 0.75],
-                         pattern: str = "random", tensor_layout: str = "NHD",
+                         pattern: str = "random", tensor_layout: str = "HND",
                          qk_quant_gran: str = "per_thread", dtype: torch.dtype = torch.float16) -> None:
     """
     Benchmark performance comparison between dense and sparse attention.
@@ -304,7 +287,7 @@ def benchmark_performance(batch_size: int = 4, num_heads: int = 32, head_dim: in
                 sm_scale=sm_scale,
                 smooth_k=True,
                 return_lse=False,
-                block_index=None
+                block_index=None,
             )
         
         dense_time = bench(dense_fn, num_warmups=5, num_tests=20)
@@ -331,7 +314,7 @@ def benchmark_performance(batch_size: int = 4, num_heads: int = 32, head_dim: in
                     sm_scale=sm_scale,
                     smooth_k=True,
                     return_lse=False,
-                    block_index=block_indices
+                    block_index=block_indices,
                 )
             
             try:
@@ -371,7 +354,7 @@ def benchmark_performance(batch_size: int = 4, num_heads: int = 32, head_dim: in
 
 def test_different_patterns(batch_size: int = 2, num_heads: int = 8, 
                            seq_len: int = 2048, head_dim: int = 128, 
-                           top_k_ratio: float = 0.5, tensor_layout: str = "NHD") -> None:
+                           top_k_ratio: float = 0.5, tensor_layout: str = "HND") -> None:
     """Test different sparse attention patterns."""
     print(f"\n=== Pattern Comparison ===")
     
@@ -397,7 +380,7 @@ def main():
     parser.add_argument('--pattern', type=str, default='random', 
                        choices=['random', 'local', 'strided', 'block_diagonal'],
                        help='Sparse attention pattern')
-    parser.add_argument('--tensor_layout', type=str, default='NHD', 
+    parser.add_argument('--tensor_layout', type=str, default='HND', 
                        choices=['NHD', 'HND'], help='Tensor layout')
     parser.add_argument('--qk_quant_gran', type=str, default='per_thread', 
                        choices=['per_warp', 'per_thread'], help='Quantization granularity')
