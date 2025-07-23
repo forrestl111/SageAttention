@@ -249,7 +249,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
       const uint32_t first_block_idx_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
                                             head_id * div_ceil(qo_len, CTA_Q) * top_k + 
                                             bx * top_k + 0;
-      initial_k_block = block_index[first_block_idx_offset];
+      initial_k_block = static_cast<uint32_t>(block_index[first_block_idx_offset]);
     } else {
       // Dense attention: start from block 0
       initial_k_block = 0;
@@ -280,7 +280,28 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
   }
 
   int p = 1;
-  for (uint32_t iter = 1; iter < num_iterations; iter++)
+  uint32_t actual_iterations = num_iterations; // Track actual number of iterations processed
+  
+  // Pre-check if we need early termination for sparse attention
+  if constexpr (IS_SPARSE) {
+    // Check blocks 0 through num_iterations-1 to find first -1
+    for (uint32_t check_block = 0; check_block < num_iterations; check_block++) {
+      const uint32_t block_idx_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
+                                      head_id * div_ceil(qo_len, CTA_Q) * top_k + 
+                                      bx * top_k + check_block;
+      int32_t current_block_idx = block_index[block_idx_offset];
+      if (current_block_idx == -1) {
+        if (check_block == 0) {
+          // First block is -1, return early
+          return;
+        }
+        actual_iterations = check_block;
+        break;
+      }
+    }
+  }
+  
+  for (uint32_t iter = 1; iter < actual_iterations; iter++)
   { 
     p ^= 1;
 
@@ -291,7 +312,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
       const uint32_t block_idx_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
                                       head_id * div_ceil(qo_len, CTA_Q) * top_k + 
                                       bx * top_k + (iter - 1);
-      current_k_block = block_index[block_idx_offset];
+      current_k_block = static_cast<uint32_t>(block_index[block_idx_offset]);
     } else {
       // Dense attention: sequential processing
       current_k_block = iter - 1;
@@ -329,7 +350,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
           const uint32_t next_block_idx_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
                                                head_id * div_ceil(qo_len, CTA_Q) * top_k + 
                                                bx * top_k + iter;
-          next_k_block = block_index[next_block_idx_offset];
+          next_k_block = static_cast<uint32_t>(block_index[next_block_idx_offset]);
       } else {
         // Dense attention: next sequential K block
         next_k_block = iter;
@@ -413,7 +434,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
           const uint32_t next_block_idx_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
                                                head_id * div_ceil(qo_len, CTA_Q) * top_k + 
                                                bx * top_k + iter;
-          next_v_block = block_index[next_block_idx_offset];
+          next_v_block = static_cast<uint32_t>(block_index[next_block_idx_offset]);
       } else {
         // Dense attention: next sequential V block
         next_v_block = iter;
@@ -422,7 +443,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     }
   }
 
-  { 
+  if (actual_iterations >= 1) {
     p ^= 1;
 
     // Get the index of the last K block
@@ -431,11 +452,13 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
       // Sparse attention: get last K block index from block_index
       const uint32_t last_block_idx_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
                                            head_id * div_ceil(qo_len, CTA_Q) * top_k + 
-                                           bx * top_k + (num_iterations - 1);
-      last_k_block = block_index[last_block_idx_offset];
+                                           bx * top_k + (actual_iterations - 1);
+      int32_t last_block_idx = block_index[last_block_idx_offset];
+      assert(last_block_idx != -1);
+      last_k_block = static_cast<uint32_t>(last_block_idx);
     } else {
       // Dense attention: last sequential K block
-      last_k_block = num_iterations - 1;
+      last_k_block = actual_iterations - 1;
     }
 
     float dequant_scale = q_scale * K_scale[k_scale_base_idx + last_k_block * k_scale_advance_offset];
@@ -789,7 +812,6 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
             bool is_sparse = block_index.has_value();
             
             if (is_sparse) {
-              std::cout << "is_sparse" << std::endl;
               auto block_tensor = block_index.value();
               block_index_ptr = reinterpret_cast<int32_t*>(block_tensor.data_ptr());
               // Assume block_index shape is [batch_size, num_heads, num_q_blocks, top_k]
@@ -806,9 +828,9 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
                   for (int q_block = 0; q_block < div_ceil(qo_len, CTA_Q); q_block++) {
                     for (int k = 0; k < top_k; k++) {
                       int32_t block_idx = accessor[b][h][q_block][k];
-                      if (block_idx < 0 || block_idx >= max_k_blocks) {
+                      if (block_idx < -1 || block_idx >= max_k_blocks) {
                         throw std::invalid_argument("block_index contains invalid block index: " + std::to_string(block_idx) + 
-                                                  " (must be in range [0, " + std::to_string(max_k_blocks-1) + "])");
+                                                  " (must be -1 or in range [0, " + std::to_string(max_k_blocks-1) + "])");
                       }
                     }
                   }
@@ -823,7 +845,6 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
               // Use sparse attention kernel
               auto* sparse_kernel = qk_int8_sv_f8_attn_kernel<CTA_Q, CTA_K, NUM_THREADS, HEAD_DIM, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), DTypeOut, mask_mode, RETURN_LSE, false, true>;
               cudaFuncSetAttribute(sparse_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
-              std::cout << "launching sparse kernel" << std::endl;
               sparse_kernel<<<grid, NUM_THREADS, sMemSize>>>(
                 tma_map_Q, tma_map_K, tma_map_V,
                 reinterpret_cast<float*>(query_scale.data_ptr()),
@@ -1027,11 +1048,6 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
             
             if (is_sparse) {
               // Use sparse attention kernel with V scale fusion
-              std::cout << "launching sparse kernel with V scale fusion" << std::endl;
-              std::cout << "top_k: " << top_k << std::endl;
-              std::cout << "sMemSize: " << sMemSize << std::endl;
-              std::cout << "grid: " << grid.x << ", " << grid.y << ", " << grid.z << std::endl;
-              std::cout << "NUM_THREADS: " << NUM_THREADS << std::endl;
               auto* sparse_kernel = qk_int8_sv_f8_attn_kernel<CTA_Q, CTA_K, NUM_THREADS, HEAD_DIM, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), DTypeOut, mask_mode, RETURN_LSE, true, true>;
               cudaFuncSetAttribute(sparse_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
               sparse_kernel<<<grid, NUM_THREADS, sMemSize>>>(
