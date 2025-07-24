@@ -241,29 +241,10 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_K);
     expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_V);
     load_async_4D(sQ, &tensorMapQ, &barrier_Q, 0, bx * CTA_Q, head_id, batch_id);
-    
-    // Determine initial K and V block based on sparse/dense mode
-    uint32_t initial_k_block;
-    if constexpr (IS_SPARSE) {
-      // Sparse attention: get first K block index from block_index
-      const uint32_t first_block_idx_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
-                                            head_id * div_ceil(qo_len, CTA_Q) * top_k + 
-                                            bx * top_k + 0;
-      initial_k_block = static_cast<uint32_t>(block_index[first_block_idx_offset]);
-    } else {
-      // Dense attention: start from block 0
-      initial_k_block = 0;
-    }
-    
-    load_async_4D(sK, &tensorMapK, &barrier_K, 0, initial_k_block * CTA_K, kv_head_id, batch_id);
-    load_async_4D(sV, &tensorMapV, &barrier_V, initial_k_block * CTA_K, 0, kv_head_id, batch_id);
   }
 
   float q_scale = Q_scale[q_scale_idx];
   float original_sm_scale = sm_scale;
-
-  // wait for Q
-  wait(&barrier_Q, 0);
 
   // Determine number of iterations based on sparse/dense mode
   uint32_t num_iterations;
@@ -280,43 +261,64 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
   }
 
   int p = 1;
-  uint32_t actual_iterations = num_iterations; // Track actual number of iterations processed
   
-  // Pre-check if we need early termination for sparse attention
+  int32_t first_k_block = 0;
+  int32_t second_k_block = 1;
+  
   if constexpr (IS_SPARSE) {
-    // Check blocks 0 through num_iterations-1 to find first -1
-    for (uint32_t check_block = 0; check_block < num_iterations; check_block++) {
-      const uint32_t block_idx_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
-                                      head_id * div_ceil(qo_len, CTA_Q) * top_k + 
-                                      bx * top_k + check_block;
-      int32_t current_block_idx = block_index[block_idx_offset];
-      if (current_block_idx == -1) {
-        if (check_block == 0) {
-          // First block is -1, return early
-          return;
-        }
-        actual_iterations = check_block;
-        break;
+    __shared__ int32_t shared_first_block_idx, shared_second_block_idx;
+    if (threadIdx.x == 0) {
+      const uint32_t first_block_idx_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
+                                            head_id * div_ceil(qo_len, CTA_Q) * top_k + 
+                                            bx * top_k + 0;
+      shared_first_block_idx = block_index[first_block_idx_offset];
+      
+      // Check if first block is -1 (early termination)
+      if (shared_first_block_idx == -1) {
+        return; // Early exit - no computation needed
+      }
+      
+      // Read second block if available
+      if (top_k > 1) {
+        shared_second_block_idx = block_index[first_block_idx_offset + 1];
+      } else {
+        shared_second_block_idx = -1; // No second block
       }
     }
+    __syncthreads();
+    first_k_block = shared_first_block_idx;
+    second_k_block = shared_second_block_idx;
+  }
+
+  // Load initial K and V blocks (only thread 0)
+  if (threadIdx.x == 0) {
+    load_async_4D(sK, &tensorMapK, &barrier_K, 0, first_k_block * CTA_K, kv_head_id, batch_id);
+    load_async_4D(sV, &tensorMapV, &barrier_V, first_k_block * CTA_K, 0, kv_head_id, batch_id);
   }
   
-  for (uint32_t iter = 1; iter < actual_iterations; iter++)
-  { 
-    p ^= 1;
+  // wait for Q
+  wait(&barrier_Q, 0);
 
-    // Determine current K block index based on sparse/dense mode
-    uint32_t current_k_block;
-    if constexpr (IS_SPARSE) {
-      // Sparse attention: get K block index from block_index
-      const uint32_t block_idx_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
-                                      head_id * div_ceil(qo_len, CTA_Q) * top_k + 
-                                      bx * top_k + (iter - 1);
-      current_k_block = static_cast<uint32_t>(block_index[block_idx_offset]);
-    } else {
-      // Dense attention: sequential processing
-      current_k_block = iter - 1;
+  // 🚀 CRITICAL OPTIMIZATION: Reuse block indices to reduce memory accesses
+  // Key insight: next_k_block from iteration N becomes current_k_block for iteration N+1
+  // 
+  // Performance gain:
+  // - Before: 3 block_index accesses per iteration (current_k + next_k + next_v)
+  // - After: 1 block_index access per iteration (only next_k, reuse for current_k and next_v)
+  // - Reduces sparse attention overhead by ~66% in block_index memory bandwidth
+  uint32_t current_k_block = first_k_block;
+  uint32_t next_k_block = second_k_block;
+  
+  const uint32_t base_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
+    head_id * div_ceil(qo_len, CTA_Q) * top_k + 
+    bx * top_k;
+
+  for (uint32_t iter = 1; iter < num_iterations; iter++)
+  { 
+    if (next_k_block == -1) {
+      break;
     }
+    p ^= 1;
 
     float dequant_scale = q_scale * K_scale[k_scale_base_idx + current_k_block * k_scale_advance_offset];
     sm_scale = original_sm_scale * dequant_scale;
@@ -344,17 +346,6 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     if (threadIdx.x == 0)
     {
       expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_K);
-      uint32_t next_k_block;
-      if constexpr (IS_SPARSE) {
-          // Sparse attention: get next K block index to process
-          const uint32_t next_block_idx_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
-                                               head_id * div_ceil(qo_len, CTA_Q) * top_k + 
-                                               bx * top_k + iter;
-          next_k_block = static_cast<uint32_t>(block_index[next_block_idx_offset]);
-      } else {
-        // Dense attention: next sequential K block
-        next_k_block = iter;
-      }
       load_async_4D(sK, &tensorMapK, &barrier_K, 0, next_k_block * CTA_K, kv_head_id, batch_id);
     }
 
@@ -428,38 +419,25 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     if (threadIdx.x == 0)
     {
       expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_V);
-      uint32_t next_v_block;
-      if constexpr (IS_SPARSE) {
-          // Sparse attention: get next V block index (same as K block)
-          const uint32_t next_block_idx_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
-                                               head_id * div_ceil(qo_len, CTA_Q) * top_k + 
-                                               bx * top_k + iter;
-          next_v_block = static_cast<uint32_t>(block_index[next_block_idx_offset]);
-      } else {
-        // Dense attention: next sequential V block
-        next_v_block = iter;
-      }
-      load_async_4D(sV, &tensorMapV, &barrier_V, next_v_block * CTA_K, 0, kv_head_id, batch_id);
+      
+      // Reuse next_k_block as next_v_block (they're the same in sparse attention)
+      load_async_4D(sV, &tensorMapV, &barrier_V, next_k_block * CTA_K, 0, kv_head_id, batch_id);
     }
-  }
 
-  if (actual_iterations >= 1) {
+    current_k_block = next_k_block;
+    // Read next_k_block
+    if constexpr (IS_SPARSE) {
+      next_k_block = static_cast<uint32_t>(block_index[base_offset + iter + 1]);
+    } else {
+      next_k_block = iter + 1;
+    }
+}
+
+{
     p ^= 1;
 
     // Get the index of the last K block
-    uint32_t last_k_block;
-    if constexpr (IS_SPARSE) {
-      // Sparse attention: get last K block index from block_index
-      const uint32_t last_block_idx_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
-                                           head_id * div_ceil(qo_len, CTA_Q) * top_k + 
-                                           bx * top_k + (actual_iterations - 1);
-      int32_t last_block_idx = block_index[last_block_idx_offset];
-      assert(last_block_idx != -1);
-      last_k_block = static_cast<uint32_t>(last_block_idx);
-    } else {
-      // Dense attention: last sequential K block
-      last_k_block = actual_iterations - 1;
-    }
+    uint32_t last_k_block = current_k_block;
 
     float dequant_scale = q_scale * K_scale[k_scale_base_idx + last_k_block * k_scale_advance_offset];
     sm_scale = original_sm_scale;
@@ -816,6 +794,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
               block_index_ptr = reinterpret_cast<int32_t*>(block_tensor.data_ptr());
               // Assume block_index shape is [batch_size, num_heads, num_q_blocks, top_k]
               top_k = block_tensor.size(3);
+              assert(top_k > 0);
               // Validate block_index shape
               CHECK_SHAPE(block_tensor, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q), top_k);
               
@@ -1039,6 +1018,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
               block_index_ptr = reinterpret_cast<int32_t*>(block_tensor.data_ptr());
               // Assume block_index shape is [batch_size, num_heads, num_q_blocks, top_k]
               top_k = block_tensor.size(3);
+              assert(top_k > 0);
               // Validate block_index shape
               CHECK_SHAPE(block_tensor, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q), top_k);
             }
