@@ -10,7 +10,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
                     int is_causal,
                     int qk_quant_gran,
                     float sm_scale,
-                    int return_lse)
+                    int return_lse,
+                    c10::optional<torch::Tensor> block_index = c10::nullopt)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);

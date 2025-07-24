@@ -783,6 +783,7 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     pv_accum_dtype: str = "fp32+fp32",
     smooth_k: bool = True,
     return_lse: bool = False,
+    block_index: Optional[torch.Tensor] = None,
     **kwargs: Any,
 ) -> torch.Tensor:
     """
@@ -833,6 +834,19 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     return_lse : bool
         Whether to return the log sum of the exponentiated attention weights. Used for cases like Ring Attention.
         Default: False.
+
+    block_index: Optional[torch.Tensor]
+        The block index tensor for sparse attention. If specified, sparse attention will be enabled.
+        Shape: [batch_size, num_qo_heads, num_q_blocks, top_k], where:
+            - batch_size: the batch size
+            - num_qo_heads: number of query/output heads
+            - num_q_blocks: number of query blocks (typically ceil(qo_len / 64))
+            - top_k: number of key blocks attended by each query block
+        block_index[b, h, q_block, k] gives the index of the k-th key block attended by the q_block-th query block
+        for batch b and head h.
+        # CTA_Q is 64; CTA_K is 128. That is, the query and key sequence dimensions are processed in blocks of 64 and 128, respectively.
+        So num_q_blocks = ceil(qo_len / 64) and the valid range for each index is [0, ceil(kv_len / 128) - 1].
+        If block_index is not specified, dense attention will be performed.
 
     Returns
     -------
@@ -923,7 +937,7 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
         raise NotImplementedError("Please use pv_accum_dtype='fp32+fp32' for sm90.")
         lse = _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
     elif pv_accum_dtype == "fp32+fp32":
-        lse = _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse, block_index)
 
     o = o[..., :head_dim_og]
 
