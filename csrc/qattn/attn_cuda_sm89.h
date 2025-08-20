@@ -26,7 +26,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn(torch::Tensor query,
                     int is_causal,
                     int qk_quant_gran,
                     float sm_scale,
-                    int return_lse);
+                    int return_lse,
+                    c10::optional<torch::Tensor> block_index = c10::nullopt);
 
 torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
                     torch::Tensor key,
@@ -39,7 +40,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(torch::Tensor query,
                     int is_causal,
                     int qk_quant_gran,
                     float sm_scale,
-                    int return_lse);
+                    int return_lse,
+                    c10::optional<torch::Tensor> block_index = c10::nullopt);
 
 torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(torch::Tensor query,
                     torch::Tensor key,
@@ -53,7 +55,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(torch::Tenso
                     int is_causal,
                     int qk_quant_gran,
                     float sm_scale,
-                    int return_lse);
+                    int return_lse,
+                    c10::optional<torch::Tensor> block_index = c10::nullopt);
 
 torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
                     torch::Tensor key,
@@ -78,7 +81,8 @@ torch::Tensor qk_int8_sv_f8_accum_f16_attn_inst_buf(torch::Tensor query,
                     int is_causal,
                     int qk_quant_gran,
                     float sm_scale,
-                    int return_lse);
+                    int return_lse,
+                    c10::optional<torch::Tensor> block_index = c10::nullopt);
 
 torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(torch::Tensor query,
                     torch::Tensor key,
@@ -105,4 +109,4 @@ torch::Tensor qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(torch::Tensor q
                     int qk_quant_gran,
                     float sm_scale,
                     int return_lse,
-                    torch::Tensor block_index = torch::Tensor());
+                    c10::optional<torch::Tensor> block_index = c10::nullopt);

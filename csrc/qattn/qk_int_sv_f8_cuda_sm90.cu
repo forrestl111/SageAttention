@@ -299,13 +299,6 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
   // wait for Q
   wait(&barrier_Q, 0);
 
-  // 🚀 CRITICAL OPTIMIZATION: Reuse block indices to reduce memory accesses
-  // Key insight: next_k_block from iteration N becomes current_k_block for iteration N+1
-  // 
-  // Performance gain:
-  // - Before: 3 block_index accesses per iteration (current_k + next_k + next_v)
-  // - After: 1 block_index access per iteration (only next_k, reuse for current_k and next_v)
-  // - Reduces sparse attention overhead by ~66% in block_index memory bandwidth
   uint32_t current_k_block = first_k_block;
   uint32_t next_k_block = second_k_block;
   
@@ -427,7 +420,11 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     current_k_block = next_k_block;
     // Read next_k_block
     if constexpr (IS_SPARSE) {
-      next_k_block = static_cast<uint32_t>(block_index[base_offset + iter + 1]);
+      if (iter + 1 < top_k) {
+        next_k_block = static_cast<uint32_t>(block_index[base_offset + iter + 1]);
+      } else {
+        next_k_block = -1; // No more blocks
+      }
     } else {
       next_k_block = iter + 1;
     }

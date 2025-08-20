@@ -7,17 +7,33 @@ by comparing it with dense SageAttention and measuring speedup.
 
 import argparse
 import torch
-import numpy as np
 from typing import List, Tuple
-import time
-# Optional imports for visualization (not used in current version)
-# import matplotlib.pyplot as plt
-# import seaborn as sns
-from flash_attn.utils.benchmark import benchmark_forward
 
 # Import SageAttention modules
-from sageattention import sageattn_qk_int8_pv_fp8_cuda_sm90
-from utils import bench, calc_diff, bench_kineto
+from sageattention import sageattn
+from sageattention.core import get_cuda_arch_versions
+from utils import bench, calc_diff
+
+def get_block_sizes_for_arch(device_idx: int = 0) -> Tuple[int, int]:
+    """
+    Get the appropriate CTA_Q and CTA_K block sizes based on GPU architecture.
+    
+    Args:
+        device_idx: CUDA device index
+        
+    Returns:
+        Tuple of (CTA_Q, CTA_K) for the given architecture
+    """
+    arch = get_cuda_arch_versions()[device_idx]
+    
+    if arch == "sm89":
+        # SM89 architecture
+        return 128, 64
+    elif arch in "sm90":
+        # SM90+ architectures
+        return 64, 128
+    else:
+        raise NotImplementedError(f"Unsupported architecture: {arch}")
 
 def create_sparse_block_indices(batch_size: int, num_heads: int, num_q_blocks: int, 
                                 num_k_blocks: int, top_k: int, 
@@ -138,10 +154,13 @@ def test_correctness(batch_size: int = 2, num_heads: int = 8, seq_len: int = 204
     print("batch_size: ", batch_size, "num_heads: ", num_heads, "seq_len: ", seq_len, "head_dim: ", head_dim, "tensor_layout: ", tensor_layout, "dtype: ", dtype)
     q, k, v = generate_test_tensors(batch_size, num_heads, seq_len, head_dim, tensor_layout, dtype)
     print("q: ", q.shape, "k: ", k.shape, "v: ", v.shape)
-    # Create sparse block indices
-    CTA_Q, CTA_K = 64, 128
+    # Create sparse block indices - get block sizes based on GPU architecture
+    CTA_Q, CTA_K = get_block_sizes_for_arch(q.device.index)
     num_q_blocks = (seq_len + CTA_Q - 1) // CTA_Q
     num_k_blocks = (seq_len + CTA_K - 1) // CTA_K
+    
+    arch = get_cuda_arch_versions()[q.device.index]
+    print(f"🔧 Detected GPU architecture: {arch}, using block sizes CTA_Q={CTA_Q}, CTA_K={CTA_K}")
     top_k = max(1, min(num_k_blocks, int(num_k_blocks * top_k_ratio)))
     
     block_indices = create_sparse_block_indices(
@@ -153,7 +172,7 @@ def test_correctness(batch_size: int = 2, num_heads: int = 8, seq_len: int = 204
     try:        
         # Run sparse attention
         print("🔄 Running sparse attention...")
-        o_sparse = sageattn_qk_int8_pv_fp8_cuda_sm90(
+        o_sparse = sageattn(
             q, k, v,
             tensor_layout=tensor_layout,
             is_causal=False,
@@ -191,7 +210,8 @@ def test_correctness(batch_size: int = 2, num_heads: int = 8, seq_len: int = 204
                     k_concat = torch.cat(k_segments, dim=2)  # [1, 1, total_k_len, head_dim]
                     v_concat = torch.cat(v_segments, dim=2)  # [1, 1, total_k_len, head_dim]
                     q_block = q[b:b+1, h:h+1, q_start:q_end, :]  # [1, 1, q_block_size, head_dim]
-                    o_block = sageattn_qk_int8_pv_fp8_cuda_sm90(
+                    print(f"q_block: {q_block.shape}, k_concat: {k_concat.shape}, v_concat: {v_concat.shape}, tensor_layout")
+                    o_block = sageattn(
                         q_block, k_concat, v_concat,
                         tensor_layout=tensor_layout,
                         is_causal=False,
@@ -221,6 +241,7 @@ def test_correctness(batch_size: int = 2, num_heads: int = 8, seq_len: int = 204
         print(f"  - Mean Absolute Error: {abs_error:.6e}")
         print(f"  - Relative Error: {relative_error:.4f}%")
         print(f"  - Max Absolute Error: {max_error:.6e}")
+        import ipdb; ipdb.set_trace()
 
         if similarity < 0.99:
             import ipdb; ipdb.set_trace()
@@ -279,7 +300,7 @@ def benchmark_performance(batch_size: int = 4, num_heads: int = 32, head_dim: in
         
         # Dense attention baseline
         def dense_fn():
-            return sageattn_qk_int8_pv_fp8_cuda_sm90(
+            return sageattn(
                 q, k, v,
                 tensor_layout=tensor_layout,
                 is_causal=False,
@@ -292,10 +313,13 @@ def benchmark_performance(batch_size: int = 4, num_heads: int = 32, head_dim: in
         
         dense_time = bench(dense_fn, num_warmups=5, num_tests=20)
         
-        # Test different sparsity levels
-        CTA_Q, CTA_K = 64, 128
+        # Test different sparsity levels - get block sizes based on GPU architecture
+        CTA_Q, CTA_K = get_block_sizes_for_arch(q.device.index)
         num_q_blocks = (seq_len + CTA_Q - 1) // CTA_Q
         num_k_blocks = (seq_len + CTA_K - 1) // CTA_K
+        
+        arch = get_cuda_arch_versions()[q.device.index]
+        print(f"🔧 Performance test using architecture: {arch}, block sizes CTA_Q={CTA_Q}, CTA_K={CTA_K}")
         
         for top_k_ratio in top_k_ratios:
             top_k = max(1, min(num_k_blocks, int(num_k_blocks * top_k_ratio)))
@@ -306,7 +330,7 @@ def benchmark_performance(batch_size: int = 4, num_heads: int = 32, head_dim: in
             
             # Sparse attention
             def sparse_fn():
-                return sageattn_qk_int8_pv_fp8_cuda_sm90(
+                return sageattn(
                     q, k, v,
                     tensor_layout=tensor_layout,
                     is_causal=False,
@@ -401,6 +425,12 @@ def main():
     print("🔍 Sparse SageAttention Test Suite")
     print(f"CUDA Device: {torch.cuda.get_device_name()}")
     print(f"CUDA Capability: {torch.cuda.get_device_capability()}")
+    
+    # Display GPU architecture and block sizes
+    arch = get_cuda_arch_versions()[0]
+    CTA_Q, CTA_K = get_block_sizes_for_arch(0)
+    print(f"🏗️ GPU Architecture: {arch}")
+    print(f"📏 Block Sizes: CTA_Q={CTA_Q}, CTA_K={CTA_K}")
     
     try:
         if args.test_correctness or not any([args.test_patterns, args.benchmark_perf]):
