@@ -232,9 +232,6 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
               : kv_len,
           CTA_K);
     }
-    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-        printf("num_iterations: %u, top_k: %u, kv_len: %u\n, CTA_K: %u\n", num_iterations, top_k, kv_len, CTA_K);
-    }
 
     // load Q with predicate
     load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, Q_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_Q>(
@@ -283,24 +280,18 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       second_k_block = shared_second_block_idx;
     }
 
-    uint32_t current_k_block = first_k_block;
-    uint32_t next_k_block = second_k_block;
+    int32_t current_k_block = first_k_block;
+    int32_t next_k_block = second_k_block;
     
     const uint32_t block_index_base_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
       head_id * div_ceil(qo_len, CTA_Q) * top_k + 
       bx * top_k;
     
     // update K_lane_ptr to current_k_block
-    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-        printf("K_lane_base_ptr before load: %p\n", (void*)K_lane_base_ptr);
-    }
     int8_t* K_lane_ptr = K_lane_base_ptr + current_k_block * CTA_K * stride_seq_k;
     // load K with predicate
     load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
       &K_lane_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
-    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-        printf("K_lane_base_ptr after load: %p\n", (void*)K_lane_base_ptr);
-    }
     cp_async::commit_group();
   
     float q_scale = Q_scale[q_scale_idx];
@@ -366,9 +357,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
           }
         }
       }
-  
-      K_idx_lane_base += CTA_K;
-  
+    
       if constexpr (std::is_same<DTypeSVAccum, float>::value)
       {
         update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, sm_scale);
@@ -395,15 +384,12 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   
       // load K without predicate
       // update K_lane_ptr to next_k_block
-      if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-        printf("current_k_block: %u, next_k_block: %u, stride_seq_k: %u\n", current_k_block, next_k_block, stride_seq_k);
-      }
       K_lane_ptr = K_lane_base_ptr + next_k_block * CTA_K * stride_seq_k;
       load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
         &K_lane_ptr, K_smem_offset_load, stride_seq_k, smem_K);
       cp_async::commit_group();
   
-      dequant_scale = q_scale * K_scale[k_scale_idx + current_k_block * k_scale_advance_offset];
+      dequant_scale = q_scale * K_scale[k_scale_idx + next_k_block * k_scale_advance_offset];
       sm_scale = original_sm_scale * dequant_scale;
       
       // ensure V is ready
@@ -453,6 +439,8 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
         next_k_block = iter + 1;
       }
     }
+
+    K_idx_lane_base += CTA_K * current_k_block;
   
     // second last iter, apply causal mask
     if (num_iterations > 1 && (num_main_iter == num_iterations - 1))
@@ -521,8 +509,9 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       __syncthreads();
   
       // load K with predicate
+      K_lane_ptr = K_lane_base_ptr + next_k_block * CTA_K * stride_seq_k;
       load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
-        &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
+        &K_lane_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
       cp_async::commit_group();
   
       dequant_scale = q_scale * K_scale[k_scale_idx + (num_iterations - 1) * k_scale_advance_offset];
@@ -556,8 +545,9 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       // load V
       // for fp16: 
       // load_global_to_share                stride_seq_v
+      V_lane_ptr = V_lane_base_ptr + next_k_block * CTA_K;
       load_fp8_V_global_to_share<global_to_shared_line_lanes_V, global_to_shared_copy_lines_per_warp_V, V_smem_iters_row, V_smem_iters_col, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, CTA_K>(
-        &V_lane_base_ptr, V_smem_offset_load, stride_d_v, smem_V);
+        &V_lane_ptr, V_smem_offset_load, stride_d_v, smem_V);
       cp_async::commit_group();
       K_load_idx_lane_base += CTA_K;
     }
@@ -650,7 +640,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       }
   
       __syncthreads();
-  
+
     }
   
     // TODO: thread block sync mdo state for num_warps_k > 0. Then only one thread block needs to do the final saving.

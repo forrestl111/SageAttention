@@ -44,7 +44,6 @@ NVCC_FLAGS = [
     "--threads=8",
     "-Xptxas=-v",
     "-diag-suppress=174", # suppress the specific warning
-    "-lineinfo",
 ]
 
 ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0

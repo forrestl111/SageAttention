@@ -153,7 +153,6 @@ def test_correctness(batch_size: int = 2, num_heads: int = 8, seq_len: int = 204
     # Generate test data
     print("batch_size: ", batch_size, "num_heads: ", num_heads, "seq_len: ", seq_len, "head_dim: ", head_dim, "tensor_layout: ", tensor_layout, "dtype: ", dtype)
     q, k, v = generate_test_tensors(batch_size, num_heads, seq_len, head_dim, tensor_layout, dtype)
-    print("q: ", q.shape, "k: ", k.shape, "v: ", v.shape)
     # Create sparse block indices - get block sizes based on GPU architecture
     CTA_Q, CTA_K = get_block_sizes_for_arch(q.device.index)
     num_q_blocks = (seq_len + CTA_Q - 1) // CTA_Q
@@ -168,6 +167,13 @@ def test_correctness(batch_size: int = 2, num_heads: int = 8, seq_len: int = 204
     
     # Scale parameter
     sm_scale = 1 / (head_dim ** 0.5)
+
+    o_default = None
+    o_dense_sage = None
+    if top_k_ratio == 1.0:
+        o_default = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False)
+        o_dense_sage = sageattn(q, k, v, tensor_layout=tensor_layout, is_causal=False, qk_quant_gran=qk_quant_gran, sm_scale=sm_scale, smooth_k=True, return_lse=False, block_index=None)
+    
     
     try:        
         # Run sparse attention
@@ -210,7 +216,6 @@ def test_correctness(batch_size: int = 2, num_heads: int = 8, seq_len: int = 204
                     k_concat = torch.cat(k_segments, dim=2)  # [1, 1, total_k_len, head_dim]
                     v_concat = torch.cat(v_segments, dim=2)  # [1, 1, total_k_len, head_dim]
                     q_block = q[b:b+1, h:h+1, q_start:q_end, :]  # [1, 1, q_block_size, head_dim]
-                    print(f"q_block: {q_block.shape}, k_concat: {k_concat.shape}, v_concat: {v_concat.shape}, tensor_layout")
                     o_block = sageattn(
                         q_block, k_concat, v_concat,
                         tensor_layout=tensor_layout,
@@ -225,24 +230,30 @@ def test_correctness(batch_size: int = 2, num_heads: int = 8, seq_len: int = 204
 
         print("✅ Reference computation completed")
         
-        # Verify correctness by comparing outputs
-        print("🔍 Verifying correctness...")
-        
-        # Calculate similarity metrics
-        diff = calc_diff(o_sparse, o_reference)
-        similarity = 1 - diff
-        
-        abs_error = torch.mean(torch.abs(o_sparse - o_reference)).item()
-        relative_error = (abs_error / torch.mean(torch.abs(o_reference)).item()) * 100
-        max_error = torch.max(torch.abs(o_sparse - o_reference)).item()
-        
-        print(f"📊 Correctness Results:")
-        print(f"  - Cosine Similarity: {similarity:.6f} ({similarity*100:.4f}%)")
-        print(f"  - Mean Absolute Error: {abs_error:.6e}")
-        print(f"  - Relative Error: {relative_error:.4f}%")
-        print(f"  - Max Absolute Error: {max_error:.6e}")
-        import ipdb; ipdb.set_trace()
+        def calc_accuracy_metrics(target, reference):
+            diff = calc_diff(target, reference)
+            similarity = 1 - diff
+            abs_error = torch.mean(torch.abs(target - reference)).item()
+            relative_error = (abs_error / torch.mean(torch.abs(reference)).item()) * 100
+            max_error = torch.max(torch.abs(target - reference)).item()
+            print(f"📊 Correctness Results:")
+            print(f"  - Cosine Similarity: {similarity:.6f} ({similarity*100:.4f}%)")
+            print(f"  - Mean Absolute Error: {abs_error:.6e}")
+            print(f"  - Relative Error: {relative_error:.4f}%")
+            print(f"  - Max Absolute Error: {max_error:.6e}")
+            return similarity, abs_error, relative_error, max_error
 
+        
+        # Verify correctness by comparing outputs
+        print("🔍 Verifying correctness between sparse and reference outputs...")
+        similarity, abs_error, relative_error, max_error = calc_accuracy_metrics(o_sparse, o_reference)
+
+        if o_default is not None:
+            print("🔍 Verifying correctness between sparse SageAttention (top_k_ratio=1.0) and pytorch SDPA outputs...")
+            calc_accuracy_metrics(o_sparse, o_default)
+            print("🔍 Verifying correctness between dense SageAttention and pytorch SDPA outputs...")
+            calc_accuracy_metrics(o_dense_sage, o_default)
+        
         if similarity < 0.99:
             import ipdb; ipdb.set_trace()
             raise ValueError(f"Cosine similarity is less than 0.99: {similarity:.6f}")

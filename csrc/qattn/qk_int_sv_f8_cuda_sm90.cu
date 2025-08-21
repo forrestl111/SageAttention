@@ -299,8 +299,8 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
   // wait for Q
   wait(&barrier_Q, 0);
 
-  uint32_t current_k_block = first_k_block;
-  uint32_t next_k_block = second_k_block;
+  int32_t current_k_block = first_k_block;
+  int32_t next_k_block = second_k_block;
   
   const uint32_t base_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
     head_id * div_ceil(qo_len, CTA_Q) * top_k + 
