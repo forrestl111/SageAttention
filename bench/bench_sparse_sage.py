@@ -29,7 +29,7 @@ def get_block_sizes_for_arch(device_idx: int = 0) -> Tuple[int, int]:
     if arch == "sm89":
         # SM89 architecture
         return 128, 64
-    elif arch in "sm90":
+    elif arch == "sm90":
         # SM90+ architectures
         return 64, 128
     else:
