@@ -12,7 +12,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(torch::Tenso
                     int is_causal,
                     int qk_quant_gran,
                     float sm_scale,
-                    int return_lse)
+                    int return_lse,
+                    c10::optional<torch::Tensor> block_index)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -156,32 +157,81 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(torch::Tenso
             //                                     smem_Q                                     smem_K                            smem_V                     smem_O
             size_t smem_max = std::max(CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t), CTA_Q * HEAD_DIM * sizeof(half));
             
-            auto kernel_func = qk_int_sv_f8_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN),
-                                                        float, false, DTypeOut, ComputeUnit::kCudaCore, mask_mode, RETURN_LSE, true, true, false>;
+            // Process block_index parameter and select appropriate kernel
+            int32_t* block_index_ptr = nullptr;
+            uint32_t top_k = 0;
+            bool is_sparse = block_index.has_value();
+            
+            if (is_sparse) {
+              auto block_tensor = block_index.value();
+              CHECK_CUDA(block_tensor);
+              CHECK_DTYPE(block_tensor, torch::kInt32);
+              CHECK_CONTIGUOUS(block_tensor);
+              block_index_ptr = reinterpret_cast<int32_t*>(block_tensor.data_ptr());
+              // Assume block_index shape is [batch_size, num_heads, num_q_blocks, top_k]
+              top_k = block_tensor.size(3);
+              assert(top_k > 0);
+              // Validate block_index shape
+              CHECK_SHAPE(block_tensor, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q), top_k);
+            }
 
-            cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+            if (is_sparse) {
+              // Use sparse attention kernel
+              auto sparse_kernel_func = qk_int_sv_f8_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN),
+                                                          float, false, DTypeOut, ComputeUnit::kCudaCore, mask_mode, RETURN_LSE, true, true, false, true>;
 
-            dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-            dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
+              cudaFuncSetAttribute(sparse_kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
 
-            kernel_func<<<grid, block, smem_max>>>(
-              query.data_ptr<int8_t>(), 
-              key.data_ptr<int8_t>(),
-              reinterpret_cast<int8_t*>(value.data_ptr()),
-              reinterpret_cast<DTypeOut*>(output.data_ptr()),
-              (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
-              reinterpret_cast<float*>(query_scale.data_ptr()),
-              reinterpret_cast<float*>(key_scale.data_ptr()),
-              reinterpret_cast<float*>(value_scale.data_ptr()),
-              reinterpret_cast<float*>(value_mean.data_ptr()),
-              qo_len,
-              kv_len,
-              num_kv_groups,
-              stride_bz_q, stride_seq_q, stride_h_q,
-              stride_bz_k, stride_seq_k, stride_h_k,
-              stride_bz_v, stride_h_v, stride_d_v,
-              stride_bz_o, stride_seq_o, stride_h_o,
-              sm_scale);
+              dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
+              dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
+
+              sparse_kernel_func<<<grid, block, smem_max>>>(
+                query.data_ptr<int8_t>(), 
+                key.data_ptr<int8_t>(),
+                reinterpret_cast<int8_t*>(value.data_ptr()),
+                reinterpret_cast<DTypeOut*>(output.data_ptr()),
+                (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
+                reinterpret_cast<float*>(query_scale.data_ptr()),
+                reinterpret_cast<float*>(key_scale.data_ptr()),
+                reinterpret_cast<float*>(value_scale.data_ptr()),
+                reinterpret_cast<float*>(value_mean.data_ptr()),
+                qo_len,
+                kv_len,
+                num_kv_groups,
+                stride_bz_q, stride_seq_q, stride_h_q,
+                stride_bz_k, stride_seq_k, stride_h_k,
+                stride_bz_v, stride_h_v, stride_d_v,
+                stride_bz_o, stride_seq_o, stride_h_o,
+                sm_scale, block_index_ptr, top_k);
+            } else {
+              // Use dense attention kernel
+              auto kernel_func = qk_int_sv_f8_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN),
+                                                          float, false, DTypeOut, ComputeUnit::kCudaCore, mask_mode, RETURN_LSE, true, true, false, false>;
+
+              cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+
+              dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
+              dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
+
+              kernel_func<<<grid, block, smem_max>>>(
+                query.data_ptr<int8_t>(), 
+                key.data_ptr<int8_t>(),
+                reinterpret_cast<int8_t*>(value.data_ptr()),
+                reinterpret_cast<DTypeOut*>(output.data_ptr()),
+                (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
+                reinterpret_cast<float*>(query_scale.data_ptr()),
+                reinterpret_cast<float*>(key_scale.data_ptr()),
+                reinterpret_cast<float*>(value_scale.data_ptr()),
+                reinterpret_cast<float*>(value_mean.data_ptr()),
+                qo_len,
+                kv_len,
+                num_kv_groups,
+                stride_bz_q, stride_seq_q, stride_h_q,
+                stride_bz_k, stride_seq_k, stride_h_k,
+                stride_bz_v, stride_h_v, stride_d_v,
+                stride_bz_o, stride_seq_o, stride_h_o,
+                sm_scale, nullptr, 0);
+            }
           });
         });
       });

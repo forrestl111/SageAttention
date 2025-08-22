@@ -123,14 +123,14 @@ __device__ __forceinline__ void arrive(uint64_t* bar) {
     );
 }
 
-template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t NUM_THREADS, uint32_t head_dim, QuantGranularity Q_GRAN, QuantGranularity K_GRAN, typename DTypeOut, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_scale=false>
+template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t NUM_THREADS, uint32_t head_dim, QuantGranularity Q_GRAN, QuantGranularity K_GRAN, typename DTypeOut, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_scale=false, bool IS_SPARSE = false>
 __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap tensorMapQ, 
                                         const __grid_constant__ CUtensorMap tensorMapK,
                                         const __grid_constant__ CUtensorMap tensorMapV,
                                         float *__restrict__ Q_scale, float *__restrict__ K_scale, float *__restrict__ V_scale,
                                         DTypeOut* O, float *__restrict__ Lse, uint32_t stride_bz_o, uint32_t stride_h_o, uint32_t stride_seq_o,
                                         const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
-                                        float sm_scale)
+                                        float sm_scale, int32_t* block_index = nullptr, uint32_t top_k = 0)
 {
   static_assert(NUM_THREADS == 128);
   static_assert(CTA_Q <= CTA_K);
@@ -182,15 +182,17 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     q_scale_idx = batch_id * num_qo_heads * (num_warp_block_q * 8) + head_id * (num_warp_block_q * 8) + bx * (4 * 8) + warp_idx * 8 + lane_id / 4;
   }
 
+  // Base K scale index (without specific K block offset)
+  uint32_t k_scale_base_idx;
   if constexpr (K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp)
   {
     const uint32_t num_block_k = div_ceil(kv_len, CTA_K);
-    k_scale_idx = batch_id * (num_qo_heads / num_kv_groups) * num_block_k + (head_id / num_kv_groups) * num_block_k;
+    k_scale_base_idx = batch_id * (num_qo_heads / num_kv_groups) * num_block_k + (head_id / num_kv_groups) * num_block_k;
   }
   else if constexpr (K_GRAN == QuantGranularity::kPerThread)
   {
     const uint32_t num_block_k = div_ceil(kv_len, CTA_K);
-    k_scale_idx = batch_id * (num_qo_heads / num_kv_groups) * (num_block_k * 4) + (head_id / num_kv_groups) * (num_block_k * 4) + lane_id % 4;
+    k_scale_base_idx = batch_id * (num_qo_heads / num_kv_groups) * (num_block_k * 4) + (head_id / num_kv_groups) * (num_block_k * 4) + lane_id % 4;
   }
 
   constexpr uint32_t k_scale_advance_offset = (K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp) ? 1 : 4;
@@ -239,28 +241,79 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_K);
     expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_V);
     load_async_4D(sQ, &tensorMapQ, &barrier_Q, 0, bx * CTA_Q, head_id, batch_id);
-    load_async_4D(sK, &tensorMapK, &barrier_K, 0, 0, kv_head_id, batch_id);
-    load_async_4D(sV, &tensorMapV, &barrier_V, 0, 0, kv_head_id, batch_id);
   }
 
   float q_scale = Q_scale[q_scale_idx];
   float original_sm_scale = sm_scale;
 
+  // Determine number of iterations based on sparse/dense mode
+  uint32_t num_iterations;
+  if constexpr (IS_SPARSE) {
+    // Sparse attention: only process top_k blocks
+    num_iterations = top_k;
+  } else {
+    // Dense attention: process all blocks
+    num_iterations = div_ceil(
+        mask_mode == MaskMode::kCausal
+            ? min(kv_len, (bx + 1) * CTA_Q)
+            : kv_len,
+        CTA_K);
+  }
+
+  int p = 1;
+  
+  int32_t first_k_block = 0;
+  int32_t second_k_block = 1;
+  
+  if constexpr (IS_SPARSE) {
+    __shared__ int32_t shared_first_block_idx, shared_second_block_idx;
+    if (threadIdx.x == 0) {
+      const uint32_t first_block_idx_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
+                                            head_id * div_ceil(qo_len, CTA_Q) * top_k + 
+                                            bx * top_k + 0;
+      shared_first_block_idx = block_index[first_block_idx_offset];
+      
+      // Check if first block is -1 (early termination)
+      if (shared_first_block_idx == -1) {
+        return; // Early exit - no computation needed
+      }
+      
+      // Read second block if available
+      if (top_k > 1) {
+        shared_second_block_idx = block_index[first_block_idx_offset + 1];
+      } else {
+        shared_second_block_idx = -1; // No second block
+      }
+    }
+    __syncthreads();
+    first_k_block = shared_first_block_idx;
+    second_k_block = shared_second_block_idx;
+  }
+
+  // Load initial K and V blocks (only thread 0)
+  if (threadIdx.x == 0) {
+    load_async_4D(sK, &tensorMapK, &barrier_K, 0, first_k_block * CTA_K, kv_head_id, batch_id);
+    load_async_4D(sV, &tensorMapV, &barrier_V, first_k_block * CTA_K, 0, kv_head_id, batch_id);
+  }
+  
   // wait for Q
   wait(&barrier_Q, 0);
 
-  const uint32_t num_iterations = div_ceil(
-      mask_mode == MaskMode::kCausal
-          ? min(kv_len, (bx + 1) * CTA_Q)
-          : kv_len,
-      CTA_K);
+  int32_t current_k_block = first_k_block;
+  int32_t next_k_block = second_k_block;
+  
+  const uint32_t base_offset = batch_id * num_qo_heads * div_ceil(qo_len, CTA_Q) * top_k + 
+    head_id * div_ceil(qo_len, CTA_Q) * top_k + 
+    bx * top_k;
 
-  int p = 1;
   for (uint32_t iter = 1; iter < num_iterations; iter++)
   { 
+    if (next_k_block == -1) {
+      break;
+    }
     p ^= 1;
 
-    float dequant_scale = q_scale * K_scale[k_scale_idx + (iter - 1) * k_scale_advance_offset];
+    float dequant_scale = q_scale * K_scale[k_scale_base_idx + current_k_block * k_scale_advance_offset];
     sm_scale = original_sm_scale * dequant_scale;
 
     // wait for K
@@ -286,7 +339,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     if (threadIdx.x == 0)
     {
       expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_K);
-      load_async_4D(sK, &tensorMapK, &barrier_K, 0, iter * CTA_K, kv_head_id, batch_id);
+      load_async_4D(sK, &tensorMapK, &barrier_K, 0, next_k_block * CTA_K, kv_head_id, batch_id);
     }
 
     // convert RS to float
@@ -359,14 +412,31 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     if (threadIdx.x == 0)
     {
       expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_V);
-      load_async_4D(sV, &tensorMapV, &barrier_V, iter * CTA_K, 0, kv_head_id, batch_id);
+      
+      // Reuse next_k_block as next_v_block (they're the same in sparse attention)
+      load_async_4D(sV, &tensorMapV, &barrier_V, next_k_block * CTA_K, 0, kv_head_id, batch_id);
     }
-  }
 
-  { 
+    current_k_block = next_k_block;
+    // Read next_k_block
+    if constexpr (IS_SPARSE) {
+      if (iter + 1 < top_k) {
+        next_k_block = static_cast<uint32_t>(block_index[base_offset + iter + 1]);
+      } else {
+        next_k_block = -1; // No more blocks
+      }
+    } else {
+      next_k_block = iter + 1;
+    }
+}
+
+{
     p ^= 1;
 
-    float dequant_scale = q_scale * K_scale[k_scale_idx + (num_iterations - 1) * k_scale_advance_offset];
+    // Get the index of the last K block
+    uint32_t last_k_block = current_k_block;
+
+    float dequant_scale = q_scale * K_scale[k_scale_base_idx + last_k_block * k_scale_advance_offset];
     sm_scale = original_sm_scale;
 
     // wait for K
@@ -415,7 +485,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
         for (uint32_t k = 0; k < 8; k++)
         {
           const uint32_t q_idx = Q_idx_lane_base + fq * 64 + 8 * ((k % 4) / 2);
-          const uint32_t k_idx = (num_iterations - 1) * CTA_K + fk * 16 + 2 * (lane_id % 4) + 8 * (k / 4) + k % 2;
+          const uint32_t k_idx = last_k_block * CTA_K + fk * 16 + 2 * (lane_id % 4) + 8 * (k / 4) + k % 2;
 
           bool is_out_of_bounds;
 
@@ -577,7 +647,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
                   int is_causal,
                   int qk_quant_gran,
                   float sm_scale,
-                  int return_lse)
+                  int return_lse,
+                  c10::optional<torch::Tensor> block_index = c10::nullopt)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -710,24 +781,69 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
             CUtensorMap tma_map_K = create_tensor_map_4D<CTA_K, HEAD_DIM>(reinterpret_cast<int8_t*>(key.data_ptr()), batch_size, num_kv_heads, kv_len, HEAD_DIM, stride_bz_k, stride_h_k, stride_seq_k);
             CUtensorMap tma_map_V = create_tensor_map_4D<HEAD_DIM, CTA_K>(reinterpret_cast<int8_t*>(value.data_ptr()), batch_size, num_kv_heads, HEAD_DIM, value.size(3), stride_bz_v, stride_h_v, stride_d_v);
 
-            auto* kernel = qk_int8_sv_f8_attn_kernel<CTA_Q, CTA_K, NUM_THREADS, HEAD_DIM, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), DTypeOut, mask_mode, RETURN_LSE, false>;
-            size_t sMemSize = CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t);
-            cudaFuncSetAttribute(
-                kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
+            // Process block_index parameter and select appropriate kernel
+            int32_t* block_index_ptr = nullptr;
+            uint32_t top_k = 0;
+            bool is_sparse = block_index.has_value();
             
+            if (is_sparse) {
+              auto block_tensor = block_index.value();
+              block_index_ptr = reinterpret_cast<int32_t*>(block_tensor.data_ptr());
+              // Assume block_index shape is [batch_size, num_heads, num_q_blocks, top_k]
+              top_k = block_tensor.size(3);
+              assert(top_k > 0);
+              // Validate block_index shape
+              CHECK_SHAPE(block_tensor, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q), top_k);
+              
+              // Validate block_index values are within valid range
+              uint32_t max_k_blocks = div_ceil(kv_len, CTA_K);
+              auto block_index_cpu = block_tensor.cpu();
+              auto accessor = block_index_cpu.accessor<int32_t, 4>();
+              for (int b = 0; b < batch_size; b++) {
+                for (int h = 0; h < num_qo_heads; h++) {
+                  for (int q_block = 0; q_block < div_ceil(qo_len, CTA_Q); q_block++) {
+                    for (int k = 0; k < top_k; k++) {
+                      int32_t block_idx = accessor[b][h][q_block][k];
+                      if (block_idx < -1 || block_idx >= max_k_blocks) {
+                        throw std::invalid_argument("block_index contains invalid block index: " + std::to_string(block_idx) + 
+                                                  " (must be -1 or in range [0, " + std::to_string(max_k_blocks-1) + "])");
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            size_t sMemSize = CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t);
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-            kernel<<<grid, NUM_THREADS, sMemSize>>>(
-              tma_map_Q,
-              tma_map_K,
-              tma_map_V,
-              reinterpret_cast<float*>(query_scale.data_ptr()),
-              reinterpret_cast<float*>(key_scale.data_ptr()),
-              nullptr,
-              reinterpret_cast<DTypeOut*>(output.data_ptr()),
-              (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
-              stride_bz_o, stride_h_o, stride_seq_o,
-              qo_len, kv_len, num_kv_groups, sm_scale);
+            
+            if (is_sparse) {
+              // Use sparse attention kernel
+              auto* sparse_kernel = qk_int8_sv_f8_attn_kernel<CTA_Q, CTA_K, NUM_THREADS, HEAD_DIM, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), DTypeOut, mask_mode, RETURN_LSE, false, true>;
+              cudaFuncSetAttribute(sparse_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
+              sparse_kernel<<<grid, NUM_THREADS, sMemSize>>>(
+                tma_map_Q, tma_map_K, tma_map_V,
+                reinterpret_cast<float*>(query_scale.data_ptr()),
+                reinterpret_cast<float*>(key_scale.data_ptr()),
+                nullptr,
+                reinterpret_cast<DTypeOut*>(output.data_ptr()),
+                (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
+                stride_bz_o, stride_h_o, stride_seq_o,
+                qo_len, kv_len, num_kv_groups, sm_scale, block_index_ptr, top_k);
+            } else {
+              // Use dense attention kernel
+              auto* dense_kernel = qk_int8_sv_f8_attn_kernel<CTA_Q, CTA_K, NUM_THREADS, HEAD_DIM, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), DTypeOut, mask_mode, RETURN_LSE, false, false>;
+              cudaFuncSetAttribute(dense_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
+              dense_kernel<<<grid, NUM_THREADS, sMemSize>>>(
+                tma_map_Q, tma_map_K, tma_map_V,
+                reinterpret_cast<float*>(query_scale.data_ptr()),
+                reinterpret_cast<float*>(key_scale.data_ptr()),
+                nullptr,
+                reinterpret_cast<DTypeOut*>(output.data_ptr()),
+                (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
+                stride_bz_o, stride_h_o, stride_seq_o,
+                qo_len, kv_len, num_kv_groups, sm_scale, nullptr, 0);
+            }
           });
         });
       });
@@ -749,7 +865,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
                     int is_causal,
                     int qk_quant_gran,
                     float sm_scale,
-                    int return_lse)
+                    int return_lse,
+                    c10::optional<torch::Tensor> block_index = c10::nullopt)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -888,24 +1005,51 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
             CUtensorMap tma_map_K = create_tensor_map_4D<CTA_K, HEAD_DIM>(reinterpret_cast<int8_t*>(key.data_ptr()), batch_size, num_kv_heads, kv_len, HEAD_DIM, stride_bz_k, stride_h_k, stride_seq_k);
             CUtensorMap tma_map_V = create_tensor_map_4D<HEAD_DIM, CTA_K>(reinterpret_cast<int8_t*>(value.data_ptr()), batch_size, num_kv_heads, HEAD_DIM, value.size(3), stride_bz_v, stride_h_v, stride_d_v);
 
-            auto* kernel = qk_int8_sv_f8_attn_kernel<CTA_Q, CTA_K, NUM_THREADS, HEAD_DIM,  static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), DTypeOut, mask_mode, RETURN_LSE, true>;
-            size_t sMemSize = CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t);
-            cudaFuncSetAttribute(
-                kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
+            // Process block_index parameter and select appropriate kernel
+            int32_t* block_index_ptr = nullptr;
+            uint32_t top_k = 0;
+            bool is_sparse = block_index.has_value();
             
+            if (is_sparse) {
+              auto block_tensor = block_index.value();
+              block_index_ptr = reinterpret_cast<int32_t*>(block_tensor.data_ptr());
+              // Assume block_index shape is [batch_size, num_heads, num_q_blocks, top_k]
+              top_k = block_tensor.size(3);
+              assert(top_k > 0);
+              // Validate block_index shape
+              CHECK_SHAPE(block_tensor, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q), top_k);
+            }
+
+            size_t sMemSize = CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t);
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-            kernel<<<grid, NUM_THREADS, sMemSize>>>(
-              tma_map_Q,
-              tma_map_K,
-              tma_map_V,
-              reinterpret_cast<float*>(query_scale.data_ptr()),
-              reinterpret_cast<float*>(key_scale.data_ptr()),
-              reinterpret_cast<float*>(value_scale.data_ptr()),
-              reinterpret_cast<DTypeOut*>(output.data_ptr()),
-              (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
-              stride_bz_o, stride_h_o, stride_seq_o,
-              qo_len, kv_len, num_kv_groups, sm_scale);
+            
+            if (is_sparse) {
+              // Use sparse attention kernel with V scale fusion
+              auto* sparse_kernel = qk_int8_sv_f8_attn_kernel<CTA_Q, CTA_K, NUM_THREADS, HEAD_DIM, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), DTypeOut, mask_mode, RETURN_LSE, true, true>;
+              cudaFuncSetAttribute(sparse_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
+              sparse_kernel<<<grid, NUM_THREADS, sMemSize>>>(
+                tma_map_Q, tma_map_K, tma_map_V,
+                reinterpret_cast<float*>(query_scale.data_ptr()),
+                reinterpret_cast<float*>(key_scale.data_ptr()),
+                reinterpret_cast<float*>(value_scale.data_ptr()),
+                reinterpret_cast<DTypeOut*>(output.data_ptr()),
+                (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
+                stride_bz_o, stride_h_o, stride_seq_o,
+                qo_len, kv_len, num_kv_groups, sm_scale, block_index_ptr, top_k);
+            } else {
+              // Use dense attention kernel with V scale fusion
+              auto* dense_kernel = qk_int8_sv_f8_attn_kernel<CTA_Q, CTA_K, NUM_THREADS, HEAD_DIM, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), DTypeOut, mask_mode, RETURN_LSE, true, false>;
+              cudaFuncSetAttribute(dense_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
+              dense_kernel<<<grid, NUM_THREADS, sMemSize>>>(
+                tma_map_Q, tma_map_K, tma_map_V,
+                reinterpret_cast<float*>(query_scale.data_ptr()),
+                reinterpret_cast<float*>(key_scale.data_ptr()),
+                reinterpret_cast<float*>(value_scale.data_ptr()),
+                reinterpret_cast<DTypeOut*>(output.data_ptr()),
+                (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,
+                stride_bz_o, stride_h_o, stride_seq_o,
+                qo_len, kv_len, num_kv_groups, sm_scale, nullptr, 0);
+            }
           });
         });
       });

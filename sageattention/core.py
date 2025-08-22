@@ -81,6 +81,7 @@ def sageattn(
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
     return_lse: bool = False,
+    block_index: Optional[torch.Tensor] = None,
     **kwargs: Any,
 ):
     """
@@ -139,15 +140,17 @@ def sageattn(
         
     arch = get_cuda_arch_versions()[q.device.index]
     if arch == "sm80":
+        assert block_index is None, "Sparse attention is not supported on SM80 architecture. Please use SM89 or higher."
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm86":
+        assert block_index is None, "Sparse attention is not supported on SM86 architecture. Please use SM89 or higher."
         return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
     elif arch == "sm89":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16")
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16", block_index=block_index)
     elif arch == "sm90":
-        return sageattn_qk_int8_pv_fp8_cuda_sm90(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32")
+        return sageattn_qk_int8_pv_fp8_cuda_sm90(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32", block_index=block_index)
     elif arch == "sm120":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16") # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
+        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16", block_index=block_index) # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
     else:
         raise ValueError(f"Unsupported CUDA architecture: {arch}")
 
@@ -600,6 +603,7 @@ def sageattn_qk_int8_pv_fp8_cuda(
     smooth_k: bool = True,
     smooth_v: bool = False,
     return_lse: bool = False,
+    block_index: Optional[torch.Tensor] = None,
     **kwargs: Any,
 ) -> torch.Tensor:
     """
@@ -655,6 +659,20 @@ def sageattn_qk_int8_pv_fp8_cuda(
     return_lse : bool
         Whether to return the log sum of the exponentiated attention weights. Used for cases like Ring Attention.
         Default: False.
+
+    block_index : Optional[torch.Tensor]
+        The block index tensor for sparse attention. If specified, sparse attention will be enabled.
+        Shape: [batch_size, num_heads, num_q_blocks, top_k], where:
+            - batch_size: the batch size
+            - num_heads: number of attention heads
+            - num_q_blocks: number of query blocks (typically ceil(qo_len / CTA_Q))
+            - top_k: number of key blocks attended by each query block
+        block_index[b, h, q_block, k] gives the index of the k-th key block attended by the q_block-th query block
+        for batch b and head h.
+        # CTA_Q is 128; CTA_K is 64. That is, the query and key sequence dimensions are processed in blocks of 128 and 64, respectively.
+        So num_q_blocks = ceil(qo_len / 128) and the valid range for each index is [0, ceil(kv_len / 64) - 1].
+        If block_index is not specified, dense attention will be performed.
+        Default: None.
 
     Returns
     -------
@@ -756,13 +774,13 @@ def sageattn_qk_int8_pv_fp8_cuda(
 
     if pv_accum_dtype == "fp32":
         if smooth_v:
-            lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, vm, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+            lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, vm, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse, block_index)
         else:
-            lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+            lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse, block_index)
     elif pv_accum_dtype == "fp32+fp32":
-        lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse, block_index)
     elif pv_accum_dtype == "fp32+fp16":
-        lse = _qattn_sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = _qattn_sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse, block_index)
 
     o = o[..., :head_dim_og]
 
@@ -783,6 +801,7 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     pv_accum_dtype: str = "fp32+fp32",
     smooth_k: bool = True,
     return_lse: bool = False,
+    block_index: Optional[torch.Tensor] = None,
     **kwargs: Any,
 ) -> torch.Tensor:
     """
@@ -833,6 +852,19 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     return_lse : bool
         Whether to return the log sum of the exponentiated attention weights. Used for cases like Ring Attention.
         Default: False.
+
+    block_index: Optional[torch.Tensor]
+        The block index tensor for sparse attention. If specified, sparse attention will be enabled.
+        Shape: [batch_size, num_qo_heads, num_q_blocks, top_k], where:
+            - batch_size: the batch size
+            - num_qo_heads: number of query/output heads
+            - num_q_blocks: number of query blocks (typically ceil(qo_len / 64))
+            - top_k: number of key blocks attended by each query block
+        block_index[b, h, q_block, k] gives the index of the k-th key block attended by the q_block-th query block
+        for batch b and head h.
+        # CTA_Q is 64; CTA_K is 128. That is, the query and key sequence dimensions are processed in blocks of 64 and 128, respectively.
+        So num_q_blocks = ceil(qo_len / 64) and the valid range for each index is [0, ceil(kv_len / 128) - 1].
+        If block_index is not specified, dense attention will be performed.
 
     Returns
     -------
@@ -923,7 +955,7 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
         raise NotImplementedError("Please use pv_accum_dtype='fp32+fp32' for sm90.")
         lse = _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
     elif pv_accum_dtype == "fp32+fp32":
-        lse = _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse, block_index)
 
     o = o[..., :head_dim_og]
 
