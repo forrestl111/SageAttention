@@ -46,11 +46,12 @@ def quant_query_per_thread_int8_kernel(Input, Output, Scale, L,
     tl.store(scale_ptrs, scale)
 
 @triton.jit
-def quant_key_per_thread_int8_kernel(Input, Output, Scale, L,
+def quant_key_per_thread_int8_kernel(Input, Output, Scale, KM, L,
                                         stride_iz, stride_ih, stride_in,
                                         stride_oz, stride_oh, stride_on,
                                         stride_sz, stride_sh,
-                                        C: tl.constexpr, BLK: tl.constexpr):      
+                                        stride_mz, stride_mh,
+                                        HAS_KM: tl.constexpr, C: tl.constexpr, BLK: tl.constexpr):
     off_blk = tl.program_id(0) // 4
     off_tld = tl.program_id(0) % 4
     off_h = tl.program_id(1)
@@ -86,6 +87,11 @@ def quant_key_per_thread_int8_kernel(Input, Output, Scale, L,
     x1 = tl.load(input_ptrs1, mask=offs_n1[:, None] < L)
     x0 = x0.to(tl.float32)
     x1 = x1.to(tl.float32)
+    if HAS_KM:
+        km_ptrs = KM + off_b * stride_mz + off_h * stride_mh + offs_k
+        km = tl.load(km_ptrs).to(tl.float32)
+        x0 = x0 - km[None, :]
+        x1 = x1 - km[None, :]
     scale = max(tl.max(tl.abs(x0)), tl.max(tl.abs(x1))) / 127. + 0.0000001
     x0_int8 = x0 / scale
     x1_int8 = x1 / scale
@@ -151,13 +157,17 @@ def quant_key_per_thread_int4_kernel(Input, Output, Scale, L,
     tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)
     tl.store(scale_ptrs, scale)
 
+#BLKQ=64, WARPQ=16, BLKK=128, WARPK=128
 def per_thread_int8(q, k, km=None, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64, sm_scale=None, tensor_layout="HND"):
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
 
-    if km is not None:
-        k = k - km
-
+    #h_qo: number of heads in the query
+    #qo_len: length of the query
+    #head_dim: dimension of each head
+    #h_kv: number of heads in the key
+    #kv_len: length of the key
+    #head_dim: dimension of each head
     if tensor_layout == "HND":
         b, h_qo, qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = k.shape
@@ -177,6 +187,15 @@ def per_thread_int8(q, k, km=None, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64, sm_sca
     else:
         raise ValueError(f"Unknown tensor layout: {tensor_layout}")
 
+    has_km = km is not None
+    if has_km:
+        km = km.squeeze(1) if tensor_layout == "NHD" else km.squeeze(2)
+        stride_bz_km, stride_h_km = km.stride(0), km.stride(1)
+    else:
+        km = k
+        stride_bz_km, stride_h_km = 0, 0
+
+    # for q 2 token share 1 scale
     q_scale = torch.empty((b, h_qo, (qo_len + BLKQ - 1) // BLKQ * (BLKQ // WARPQ) * 8), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((b, h_kv, (kv_len + BLKK - 1) // BLKK * (BLKK // WARPK) * 4), device=q.device, dtype=torch.float32)
 
@@ -194,11 +213,12 @@ def per_thread_int8(q, k, km=None, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64, sm_sca
 
     grid = ((kv_len + BLKK - 1) // BLKK * (BLKK // WARPK) * 4, h_kv, b)
     quant_key_per_thread_int8_kernel[grid](
-        k, k_int8, k_scale, kv_len,
+        k, k_int8, k_scale, km, kv_len,
         stride_bz_k, stride_h_k, stride_seq_k,
         stride_bz_ko, stride_h_ko, stride_seq_ko,
         k_scale.stride(0), k_scale.stride(1),
-        C=head_dim, BLK=WARPK
+        stride_bz_km, stride_h_km,
+        HAS_KM=has_km, C=head_dim, BLK=WARPK
     )
 
     return q_int8, q_scale, k_int8, k_scale

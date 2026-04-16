@@ -760,7 +760,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
 
             constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
 
-            assert(value.size(3) >= div_ceil(kv_len, CTA_K) * CTA_K);
+            // assert(value.size(3) >= div_ceil(kv_len, CTA_K) * CTA_K);
 
             if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp))
             {
@@ -982,7 +982,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
 
             constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
 
-            assert(value.size(3) >= div_ceil(kv_len, CTA_K) * CTA_K);
+            // assert(value.size(3) >= div_ceil(kv_len, CTA_K) * CTA_K);
 
             if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp))
             {

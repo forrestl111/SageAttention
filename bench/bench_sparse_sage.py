@@ -262,6 +262,8 @@ def test_correctness(batch_size: int = 2, num_heads: int = 8, seq_len: int = 204
         dense_blocks = num_q_blocks * num_k_blocks
         sparse_blocks = num_q_blocks * top_k
         memory_savings = 1 - (sparse_blocks / dense_blocks)
+
+        # print("block_indices: ", block_indices)
         
         print(f"Block indices shape: {block_indices.shape}")
         print(f"Top-K blocks per query: {top_k}/{num_k_blocks} ({top_k_ratio:.1%})")
@@ -405,12 +407,12 @@ def test_different_patterns(batch_size: int = 2, num_heads: int = 8,
 
 def main():
     parser = argparse.ArgumentParser(description='Sparse SageAttention Benchmark')
-    parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
-    parser.add_argument('--num_heads', type=int, default=32, help='Number of heads')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
+    parser.add_argument('--num_heads', type=int, default=5, help='Number of heads')
     parser.add_argument('--head_dim', type=int, default=128, help='Head dimension')
-    parser.add_argument('--seq_lens', nargs='+', type=int, default=[1024, 2048, 4096], 
+    parser.add_argument('--seq_lens', nargs='+', type=int, default=[91 * 23 * 40], 
                        help='Sequence lengths to test')
-    parser.add_argument('--top_k_ratios', nargs='+', type=float, default=[0.25, 0.5, 0.75], 
+    parser.add_argument('--top_k_ratios', nargs='+', type=float, default=[0.1, 0.2, 1.0], 
                        help='Top-K ratios to test')
     parser.add_argument('--pattern', type=str, default='random', 
                        choices=['random', 'local', 'strided', 'block_diagonal'],

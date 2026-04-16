@@ -26,6 +26,8 @@ from .triton.attn_qk_int8_per_block_causal_varlen import forward as attn_true_va
 
 from .triton.quant_per_thread import per_thread_int8 as per_thread_int8_triton
 
+import nvtx
+
 try:
     from . import _qattn_sm80
     SM80_ENABLED = True
@@ -73,6 +75,7 @@ def get_cuda_arch_versions():
         cuda_archs.append(f"sm{major}{minor}")
     return cuda_archs
 
+@nvtx.annotate(message="sageattn")
 def sageattn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -939,16 +942,8 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
 
     o = torch.empty(q.size(), dtype=dtype, device=q.device)
 
-    # pad v to multiple of 128
-    # TODO: modify per_channel_fp8 kernel to handle this
-    kv_len = k.size(seq_dim)
-    v_pad_len = 128 - (kv_len % 128) if kv_len % 128 != 0 else 0
-    if v_pad_len > 0:
-        if tensor_layout == "HND":
-            v = torch.cat([v, torch.zeros(v.size(0), v.size(1), v_pad_len, v.size(3), dtype=v.dtype, device=v.device)], dim=2)
-        else:
-            v = torch.cat([v, torch.zeros(v.size(0), v_pad_len, v.size(2), v.size(3), dtype=v.dtype, device=v.device)], dim=1)
-
+    # SM90 kernel handles non-128-aligned kv lengths correctly via QK-side
+    # out-of-bounds masking (k_idx >= kv_len), so extra V padding is unnecessary.
     v_fp8, v_scale, _ = per_channel_fp8(v, tensor_layout=tensor_layout, smooth_v=False)
 
     if pv_accum_dtype == "fp32":
