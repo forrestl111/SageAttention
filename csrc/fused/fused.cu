@@ -426,6 +426,68 @@ __global__ void MeanScaleKernel(T *__restrict__ input, int8_t *__restrict__ outp
   }
 }
 
+template <uint32_t head_dim, uint32_t CTA_SIZE, bool pad_zero=false, typename T>
+__global__ void TransposePadPermuteScaleFuseQuantKernel(
+    T *__restrict__ input,
+    int8_t *__restrict__ output,
+    float *__restrict__ inv_scale,
+    const uint32_t num_tokens,
+    const uint32_t stride_bz_input,
+    const uint32_t stride_seq_input,
+    const uint32_t stride_h_input,
+    const uint32_t stride_bz_output,
+    const uint32_t stride_d_output,
+    const uint32_t stride_h_output,
+    const uint32_t stride_bz_inv_scale,
+    const uint32_t stride_h_inv_scale)
+{
+  static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 are supported");
+
+  constexpr uint32_t pack_size = 8;
+  uint32_t num_threads_per_token = head_dim / pack_size;
+  uint32_t num_threads_per_cta = CTA_SIZE / pack_size;
+
+  uint32_t bx = blockIdx.x;
+  uint32_t head_id = blockIdx.y;
+  uint32_t batch_id = blockIdx.z;
+  uint32_t thread_id = threadIdx.x;
+
+  uint32_t thread_base_token = bx * CTA_SIZE + thread_id / num_threads_per_token;
+
+  T *input_ptr_base = input + batch_id * stride_bz_input + head_id * stride_h_input + thread_base_token * stride_seq_input + thread_id % num_threads_per_token * pack_size;
+  int8_t *output_ptr_base = output + batch_id * stride_bz_output + head_id * stride_h_output + bx * CTA_SIZE + thread_id % num_threads_per_cta * pack_size + thread_id / num_threads_per_cta * stride_d_output;
+
+  __shared__ T shared_load[CTA_SIZE][head_dim];
+
+  // 0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15
+  uint32_t smem_load_row_base = ((thread_id / num_threads_per_token) / 16) * 16;
+  uint32_t smem_load_row_mod = (thread_id / num_threads_per_token) % 16;
+  uint32_t smem_load_row = smem_load_row_base + (smem_load_row_mod / 8) * 2 + ((smem_load_row_mod / 2) % 4) * 4 + (smem_load_row_mod % 2);
+
+  constexpr cp_async::SharedMemFillMode fill_mode = pad_zero ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
+  cp_async::pred_load_128b<cp_async::PrefetchMode::kNoPrefetch, fill_mode>(
+      shared_load[smem_load_row] + thread_id % num_threads_per_token * pack_size, input_ptr_base, thread_base_token < num_tokens);
+  cp_async::commit_group();
+  cp_async::wait_group<0>();
+  __syncthreads();
+
+  uint32_t d_id = thread_id / num_threads_per_cta;
+  uint32_t token_base = (thread_id % num_threads_per_cta) * pack_size;
+  float recp_scale = inv_scale[batch_id * stride_bz_inv_scale + head_id * stride_h_inv_scale + d_id];
+
+  float x_val_float[8];
+  uint32_t x_val_fp8[2];
+#pragma unroll
+  for (uint32_t i = 0; i < pack_size; i++)
+  {
+    x_val_float[i] = convert_to_float(shared_load[token_base + i][d_id]) * recp_scale;
+  }
+
+  floatx4_to_e4m3x4(x_val_fp8, x_val_float, x_val_float + 2);
+  floatx4_to_e4m3x4(x_val_fp8 + 1, x_val_float + 4, x_val_float + 6);
+  *(uint2*)(output_ptr_base) = *(uint2*)(&x_val_fp8[0]);
+}
+
 void quant_per_block_int8_cuda(
                 torch::Tensor input,
                 torch::Tensor output,
@@ -1079,5 +1141,76 @@ void mean_scale_fuse_quant_cuda(
       mean.stride(0), mean.stride(1),
       scale.stride(0), scale.stride(1)
     );
+  });
+}
+
+void transpose_pad_permute_scale_fuse_quant_cuda(
+                torch::Tensor input,
+                torch::Tensor output,
+                torch::Tensor inv_scale,
+                int tensor_layout)
+{
+  CHECK_CUDA(input);
+  CHECK_CUDA(output);
+  CHECK_CUDA(inv_scale);
+
+  CHECK_LASTDIM_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(output);
+  CHECK_CONTIGUOUS(inv_scale);
+  CHECK_DTYPE(inv_scale, torch::kFloat);
+
+  CHECK_DIMS(input, 4);
+  CHECK_DIMS(output, 4);
+  CHECK_DIMS(inv_scale, 3);
+
+  constexpr int CTA_SIZE = 64;
+
+  const int batch_size = input.size(0);
+  const int head_dim = input.size(3);
+
+  int num_tokens, padded_num_tokens, num_heads;
+  int stride_seq_input, stride_h_input, stride_d_output, stride_h_output;
+  if (tensor_layout == 0)
+  {
+    num_tokens = input.size(1);
+    num_heads = input.size(2);
+    stride_seq_input = input.stride(1);
+    stride_h_input = input.stride(2);
+    stride_d_output = output.stride(1);
+    stride_h_output = output.stride(2);
+
+    padded_num_tokens = (num_tokens + CTA_SIZE - 1) / CTA_SIZE * CTA_SIZE;
+    CHECK_SHAPE(output, batch_size, head_dim, num_heads, padded_num_tokens);
+  }
+  else
+  {
+    num_tokens = input.size(2);
+    num_heads = input.size(1);
+    stride_seq_input = input.stride(2);
+    stride_h_input = input.stride(1);
+    stride_d_output = output.stride(2);
+    stride_h_output = output.stride(1);
+
+    padded_num_tokens = (num_tokens + CTA_SIZE - 1) / CTA_SIZE * CTA_SIZE;
+    CHECK_SHAPE(output, batch_size, num_heads, head_dim, padded_num_tokens);
+  }
+
+  CHECK_SHAPE(inv_scale, batch_size, num_heads, head_dim);
+
+  auto input_dtype = input.scalar_type();
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
+    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+      dim3 grid(padded_num_tokens / CTA_SIZE, num_heads, batch_size);
+      dim3 block(CTA_SIZE * (HEAD_DIM / 8));
+      TransposePadPermuteScaleFuseQuantKernel<HEAD_DIM, CTA_SIZE, true, c_type><<<grid, block>>>(
+        reinterpret_cast<c_type*>(input.data_ptr()),
+        reinterpret_cast<int8_t*>(output.data_ptr()),
+        reinterpret_cast<float*>(inv_scale.data_ptr()),
+        num_tokens,
+        input.stride(0), stride_seq_input, stride_h_input,
+        output.stride(0), stride_d_output, stride_h_output,
+        inv_scale.stride(0), inv_scale.stride(1)
+      );
+    });
   });
 }

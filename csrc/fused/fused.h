@@ -74,3 +74,9 @@ void mean_scale_fuse_quant_cuda(
                 int num_tokens,
                 float scale_max,
                 int tensor_layout);
+
+void transpose_pad_permute_scale_fuse_quant_cuda(
+                torch::Tensor input,
+                torch::Tensor output,
+                torch::Tensor inv_scale,
+                int tensor_layout);

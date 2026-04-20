@@ -18,6 +18,30 @@ import torch
 from typing import Any, List, Literal, Optional, Tuple, Union
 
 from . import _fused
+import nvtx
+
+
+@torch.compile(dynamic=True)
+def _compute_per_channel_scale_inv_scale_torch(
+    v: torch.Tensor,
+    tensor_layout: int,
+    scale_max: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute per-channel scale / inverse-scale using PyTorch ops.
+
+    Returns:
+        scale: [B, H, D], float32
+        inv_scale: [B, H, D], float32
+    """
+    # Reduce along sequence dimension and keep math in fp32
+    seq_dim = 1 if tensor_layout == 0 else 2
+    amax = v.abs().to(torch.float32).amax(dim=seq_dim)
+    amax = torch.clamp(amax, min=1e-6)
+    scale = amax / scale_max
+    inv_scale = scale_max / amax
+    return scale, inv_scale
+
 
 def per_block_int8(
     q: torch.Tensor, 
@@ -221,6 +245,7 @@ def sub_mean(
 
     return v_smoothed, vm
 
+@nvtx.annotate(message="per_channel_fp8")
 def per_channel_fp8(
     v: torch.Tensor,
     tensor_layout: str ="HND",
@@ -271,25 +296,25 @@ def per_channel_fp8(
     if tensor_layout == "HND":
         b, h_kv, kv_len, head_dim = v.shape
         padded_len = (kv_len + 63) // 64 * 64
-        v_transposed_permutted = torch.empty((b, h_kv, head_dim, padded_len), dtype=v.dtype, device=v.device)
-
+        v_fp8_shape = (b, h_kv, head_dim, padded_len)
     elif tensor_layout == "NHD":
         b, kv_len, h_kv, head_dim = v.shape
         padded_len = (kv_len + 63) // 64 * 64
-        v_transposed_permutted = torch.empty((b, head_dim, h_kv, padded_len), dtype=v.dtype, device=v.device)
-    
-    _fused.transpose_pad_permute_cuda(v, v_transposed_permutted, _tensor_layout)
+        v_fp8_shape = (b, head_dim, h_kv, padded_len)
 
-    v_fp8 = torch.empty(v_transposed_permutted.shape, dtype=torch.float8_e4m3fn, device=v.device)
+    v_fp8 = torch.empty(v_fp8_shape, dtype=torch.float8_e4m3fn, device=v.device)
 
     v_scale = torch.empty((b, h_kv, head_dim), dtype=torch.float32, device=v.device)
-    vm = torch.empty((b, h_kv, head_dim), dtype=torch.float32, device=v.device)
 
     if smooth_v:
+        v_transposed_permutted = torch.empty(v_fp8_shape, dtype=v.dtype, device=v.device)
+        vm = torch.empty((b, h_kv, head_dim), dtype=torch.float32, device=v.device)
+        _fused.transpose_pad_permute_cuda(v, v_transposed_permutted, _tensor_layout)
         _fused.mean_scale_fuse_quant_cuda(v_transposed_permutted, v_fp8, vm, v_scale, kv_len, scale_max, _tensor_layout)
         return v_fp8, v_scale, vm
     else:
-        _fused.scale_fuse_quant_cuda(v_transposed_permutted, v_fp8, v_scale, kv_len, scale_max, _tensor_layout)
+        v_scale, v_inv_scale = _compute_per_channel_scale_inv_scale_torch(v, _tensor_layout, scale_max)
+        _fused.transpose_pad_permute_scale_fuse_quant_cuda(v, v_fp8, v_inv_scale, _tensor_layout)
         return v_fp8, v_scale, None
 
 
