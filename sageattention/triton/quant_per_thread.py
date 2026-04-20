@@ -19,11 +19,11 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def quant_query_per_thread_int8_kernel(Input, Output, Scale, L,
-                                        stride_iz, stride_ih, stride_in,
-                                        stride_oz, stride_oh, stride_on,
-                                        stride_sz, stride_sh,
-                                        C: tl.constexpr, BLK: tl.constexpr):
+def quant_query_per_thread_int8_kernel_legacy(Input, Output, Scale, L,
+                                               stride_iz, stride_ih, stride_in,
+                                               stride_oz, stride_oh, stride_on,
+                                               stride_sz, stride_sh,
+                                               C: tl.constexpr, BLK: tl.constexpr):
     off_blk = tl.program_id(0) // 8
     off_tld = tl.program_id(0) % 8
     off_h = tl.program_id(1)
@@ -43,6 +43,38 @@ def quant_query_per_thread_int8_kernel(Input, Output, Scale, L,
     x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
     x_int8 = x_int8.to(tl.int8)
     tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)
+    tl.store(scale_ptrs, scale)
+
+@triton.jit
+def quant_query_per_thread_int8_kernel(Input, Output, Scale, L,
+                                        stride_iz, stride_ih, stride_in,
+                                        stride_oz, stride_oh, stride_on,
+                                        stride_sz, stride_sh,
+                                        C: tl.constexpr, BLK: tl.constexpr):
+    off_blk = tl.program_id(0)
+    off_h = tl.program_id(1)
+    off_b = tl.program_id(2)
+
+    offs_tld = tl.arange(0, 8)
+    offs_grp = tl.arange(0, BLK // 8)
+    offs_k = tl.arange(0, C)
+    offs_n = off_blk * BLK + offs_grp[None, :] * 8 + offs_tld[:, None]
+
+    input_ptrs = Input + off_b * stride_iz + off_h * stride_ih + offs_n[:, :, None] * stride_in + offs_k[None, None, :]
+    output_ptrs = Output + off_b * stride_oz + off_h * stride_oh + offs_n[:, :, None] * stride_on + offs_k[None, None, :]
+    scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk * 8 + offs_tld
+
+    mask = offs_n[:, :, None] < L
+    x = tl.load(input_ptrs, mask=mask)
+    x = x.to(tl.float32)
+
+    x_abs = tl.abs(x)
+    scale = tl.max(tl.max(x_abs, axis=2), axis=1) / 127. + 0.0000001
+    x_int8 = x / scale[:, None, None]
+    x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
+    x_int8 = x_int8.to(tl.int8)
+
+    tl.store(output_ptrs, x_int8, mask=mask)
     tl.store(scale_ptrs, scale)
 
 @triton.jit
@@ -158,7 +190,18 @@ def quant_key_per_thread_int4_kernel(Input, Output, Scale, L,
     tl.store(scale_ptrs, scale)
 
 #BLKQ=64, WARPQ=16, BLKK=128, WARPK=128
-def per_thread_int8(q, k, km=None, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64, sm_scale=None, tensor_layout="HND"):
+def per_thread_int8(
+    q,
+    k,
+    km=None,
+    BLKQ=128,
+    WARPQ=32,
+    BLKK=64,
+    WARPK=64,
+    sm_scale=None,
+    tensor_layout="HND",
+    use_fast_query=True,
+):
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
 
@@ -197,19 +240,30 @@ def per_thread_int8(q, k, km=None, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64, sm_sca
 
     # for q 2 token share 1 scale
     q_scale = torch.empty((b, h_qo, (qo_len + BLKQ - 1) // BLKQ * (BLKQ // WARPQ) * 8), device=q.device, dtype=torch.float32)
+    # for k 32 token share 1 scale
     k_scale = torch.empty((b, h_kv, (kv_len + BLKK - 1) // BLKK * (BLKK // WARPK) * 4), device=q.device, dtype=torch.float32)
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
-    grid = ((qo_len + BLKQ - 1) // BLKQ * (BLKQ // WARPQ) * 8, h_qo, b)
-    quant_query_per_thread_int8_kernel[grid](
-        q, q_int8, q_scale, qo_len,
-        stride_bz_q, stride_h_q, stride_seq_q,
-        stride_bz_qo, stride_h_qo, stride_seq_qo,
-        q_scale.stride(0), q_scale.stride(1),
-        C=head_dim, BLK=WARPQ
-    )
+    if use_fast_query:
+        grid = ((qo_len + BLKQ - 1) // BLKQ * (BLKQ // WARPQ), h_qo, b)
+        quant_query_per_thread_int8_kernel[grid](
+            q, q_int8, q_scale, qo_len,
+            stride_bz_q, stride_h_q, stride_seq_q,
+            stride_bz_qo, stride_h_qo, stride_seq_qo,
+            q_scale.stride(0), q_scale.stride(1),
+            C=head_dim, BLK=WARPQ
+        )
+    else:
+        grid = ((qo_len + BLKQ - 1) // BLKQ * (BLKQ // WARPQ) * 8, h_qo, b)
+        quant_query_per_thread_int8_kernel_legacy[grid](
+            q, q_int8, q_scale, qo_len,
+            stride_bz_q, stride_h_q, stride_seq_q,
+            stride_bz_qo, stride_h_qo, stride_seq_qo,
+            q_scale.stride(0), q_scale.stride(1),
+            C=head_dim, BLK=WARPQ
+        )
 
     grid = ((kv_len + BLKK - 1) // BLKK * (BLKK // WARPK) * 4, h_kv, b)
     quant_key_per_thread_int8_kernel[grid](
